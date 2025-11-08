@@ -1,0 +1,185 @@
+#include <SoftwareSerial.h>
+
+SoftwareSerial esp(2, 3); 
+
+const int trigPin = 9;
+const int echoPin = 10;
+const int greenLED = 11;
+const int yellowLED = 12;
+const int redLED = 13;
+const int buzzer = 8;
+
+const char* SERVER_IP = "10.0.0.98";
+const int SERVER_PORT = 5000;
+
+const char* SSID = "ATPlus-Gabriel 2.4G";
+const char* PASSWORD = "15190629";
+
+long duration;
+int distance;
+int lastState = -1;
+
+unsigned long lastMeasure = 0;
+const int measureInterval = 150;
+
+void sendCommand(const String& cmd, unsigned long timeout) {
+
+  esp.println(cmd);
+
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    if (esp.available()) {
+      esp.read();
+    }
+  }
+
+}
+
+bool waitForResponse(const char* target, unsigned long timeout) {
+  unsigned long start = millis();
+  String response = "";
+  while (millis() - start < timeout) {
+    while (esp.available()) {
+      char c = esp.read();
+      response += c;
+      if (strstr(response.c_str(), target) != NULL) {
+        return true;
+      }
+      if (strstr(response.c_str(), "CLOSED") != NULL || strstr(response.c_str(), "ERROR") != NULL) {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+int getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  duration = pulseIn(echoPin, HIGH, 20000UL); 
+  
+  if (duration == 0) return -1;
+
+  return duration * 0.034 / 2;
+}
+
+int getCurrentState(int distance) {
+  if (distance < 0) return -1; // Estado inválido
+  if (distance <= 5) return 0;
+  if (distance <= 15) return 1;
+  return 2;
+}
+
+void updateAlerts(int currentState) {
+  bool redState = (currentState == 0);
+  bool yellowState = (currentState == 1);
+  bool greenState = (currentState == 2);
+
+  digitalWrite(greenLED, greenState ? HIGH : LOW);
+  digitalWrite(yellowLED, yellowState ? HIGH : LOW);
+  digitalWrite(redLED, redState ? HIGH : LOW);
+  analogWrite(buzzer, redState ? 1000 : 0);
+}
+
+String stateToString(int s) {
+  switch (s) {
+    case 0: return "Vermelho";
+    case 1: return "Amarelo";
+    case 2: return "Verde";
+    default: return "Desconhecido";
+  }
+}
+
+
+void sendHTTP(int distance) {
+  
+  esp.print(F("AT+CIPSTART=\"TCP\",\""));
+  esp.print(SERVER_IP);
+  esp.print(F("\","));
+  esp.println(SERVER_PORT);
+  
+  if (!waitForResponse("OK", 5000) && !waitForResponse("CONNECT", 5000)) {
+    return;
+  }
+  
+  String postData = "distance=" + String(distance);
+  String request =
+    "POST /publish HTTP/1.1\r\n"
+    "Host: " + String(SERVER_IP) + "\r\n"
+    "Content-Type: application/x-www-form-urlencoded\r\n"
+    "Content-Length: " + String(postData.length()) + "\r\n"
+    "Connection: close\r\n\r\n" +
+    postData;
+
+  esp.print("AT+CIPSEND=");
+  esp.println(request.length());
+  
+  if (!waitForResponse(">", 2000)) {
+    sendCommand(F("AT+CIPCLOSE"), 500);
+    return;
+  }
+  
+  esp.print(request);
+  
+  waitForResponse("CLOSED", 5000);
+  sendCommand(F("AT+CIPCLOSE"), 500); 
+}
+
+
+void setup() {
+  Serial.begin(9600);
+  esp.begin(9600);
+
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(greenLED, OUTPUT);
+  pinMode(yellowLED, OUTPUT);
+  pinMode(redLED, OUTPUT);
+  pinMode(buzzer, OUTPUT);
+
+  updateAlerts(-1); 
+
+  Serial.println(F("Iniciando ESP8266..."));
+  
+  sendCommand(F("AT"), 2000);
+  sendCommand(F("AT+CWMODE=1"), 2000);
+  sendCommand(String("AT+CWJAP=\"") + SSID + "\",\"" + PASSWORD + "\"", 15000);
+  sendCommand(F("AT+CIPMUX=0"), 2000);
+  
+  Serial.println(F("Configuração concluída!"));
+}
+
+void loop() {
+  unsigned long now = millis();
+  
+  if (now - lastMeasure >= measureInterval) {
+    lastMeasure = now;
+    
+    distance = getDistance();
+    
+    if (distance < 0) {
+      return;
+    }
+    
+    int currentState = getCurrentState(distance);
+    
+    Serial.print(F("Distância: "));
+    Serial.print(distance);
+    Serial.println(F(" cm"));
+    
+    updateAlerts(currentState);
+
+    if (currentState != lastState) {
+      lastState = currentState;
+      Serial.print(F("Mudança detectada -> "));
+      Serial.println(stateToString(currentState));
+      
+      sendHTTP(distance);
+    }
+  }
+}
